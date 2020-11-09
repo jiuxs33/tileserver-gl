@@ -15,6 +15,7 @@ const express = require('express');
 const handlebars = require('handlebars');
 const mercator = new (require('@mapbox/sphericalmercator'))();
 const morgan = require('morgan');
+const {　Pool } = require('pg');
 
 const packageJson = require('../package');
 const serve_font = require('./serve_font');
@@ -29,9 +30,11 @@ if (!isLight) {
   serve_rendered = require('./serve_rendered');
 }
 
+//启动服务
 function start(opts) {
   console.log('Starting server');
 
+  //禁用x-powered-by 并生成express
   const app = express().disable('x-powered-by'),
     serving = {
       styles: {},
@@ -40,8 +43,13 @@ function start(opts) {
       fonts: {}
     };
 
+  //启用代理
   app.enable('trust proxy');
+  app.use(express.json());
+  app.use(express.urlencoded({ extended: true }));
 
+
+  // 日志配置
   if (process.env.NODE_ENV !== 'test') {
     const defaultLogFormat = process.env.NODE_ENV === 'production' ? 'tiny' : 'dev';
     const logFormat = opts.logFormat || defaultLogFormat;
@@ -51,8 +59,21 @@ function start(opts) {
     }));
   }
 
+  // 连接数据库
+  const pool = new Pool({
+    user: 'postgres',
+    host: 'localhost',
+    database: 'postgres',
+    password: 'asdf!@#$zxcv',
+    port: 5432,
+    max: 20,
+    idleTimeoutMillis: 1000,
+    connectionTimeoutMillis: 1000
+  });
+
   let config = opts.config || null;
   let configPath = null;
+  // 如果启动时设置了config才会走这一步
   if (opts.configPath) {
     configPath = path.resolve(opts.configPath);
     try {
@@ -69,11 +90,14 @@ function start(opts) {
   }
 
   const options = config.options || {};
-  const paths = options.paths || {};
+  const paths = options.paths || {}; //存放样式 字体 图标 mbtiles文件完整路径
   options.paths = paths;
+  //paths.root = '/usr/src/app/node_module/tileserver-gl-styles/'
+  //process.cwd() 获取项目当前位置
   paths.root = path.resolve(
     configPath ? path.dirname(configPath) : process.cwd(),
     paths.root || '');
+  // paths.styles= paths.root+'/styles/'
   paths.styles = path.resolve(paths.root, paths.styles || '');
   paths.fonts = path.resolve(paths.root, paths.fonts || '');
   paths.sprites = path.resolve(paths.root, paths.sprites || '');
@@ -81,6 +105,7 @@ function start(opts) {
 
   const startupPromises = [];
 
+  //检查文件是否存在
   const checkPath = type => {
     if (!fs.existsSync(paths[type])) {
       console.error(`The specified path for "${type}" does not exist (${paths[type]}).`);
@@ -104,8 +129,11 @@ function start(opts) {
     app.use(cors());
   }
 
-  app.use('/data/', serve_data.init(options, serving.data));
-  app.use('/styles/', serve_style.init(options, serving.styles));
+  // javascript是引用传递，所以在传递对象的时候，如果在方法体内修改了对象的值，方法体外
+  // 再次引用此对象的时候，对象是改变后的。
+  // 所以init的时候传入的serving是add方法后的值
+  app.use('/data/', serve_data.init(options, serving.data)); // 初始化data子路由
+  app.use('/styles/', serve_style.init(options, serving.styles)); // 初始化样式子路由
   if (serve_rendered) {
     startupPromises.push(
       serve_rendered.init(options, serving.rendered)
@@ -115,11 +143,18 @@ function start(opts) {
     );
   }
 
+  /**
+   * 样式
+   * @param {string} id 样式id
+   * @param {object} item 样式对象 {style：样式路径，tilejson：}
+   * @param {boolean} allowMoreData 
+   * @param {boolean} reportFonts 使用自定义字体
+   */
   let addStyle = (id, item, allowMoreData, reportFonts) => {
     let success = true;
     if (item.serve_data !== false) {
         success = serve_style.add(options, serving.styles, item, id, opts.publicUrl,
-        (mbtiles, fromData) => {
+        (mbtiles, fromData) => { //
           let dataItemId;
           for (const id of Object.keys(data)) {
             if (fromData) {
@@ -136,7 +171,7 @@ function start(opts) {
             return dataItemId;
           } else {
             if (fromData || !allowMoreData) {
-              console.log(`ERROR: style "${item.style}" using unknown mbtiles "${mbtiles}"! Skipping...`);
+              console.log(`ERROR: style "${file.name}" using unknown mbtiles "${mbtiles}"! Skipping...`);
               return undefined;
             } else {
               let id = mbtiles.substr(0, mbtiles.lastIndexOf('.')) || mbtiles;
@@ -172,6 +207,62 @@ function start(opts) {
     }
   };
 
+  let addUrlStyle = (id, styleJson, allowMoreData, reportFonts) => {
+    if (serve_rendered) {
+      let success = serve_style.addByUrl(options, serving.styles, styleJson, id, opts.publicUrl,
+        (mbtiles, fromData) => { //
+          let dataItemId;
+          for (const id of Object.keys(data)) {
+            if (fromData) {
+              if (id === mbtiles) {
+                dataItemId = id;
+              }
+            } else {
+              if (data[id].mbtiles === mbtiles) {
+                dataItemId = id;
+              }
+            }
+          }
+          if (dataItemId) { // mbtiles exist in the data config
+            return dataItemId;
+          } else {
+            if (fromData || !allowMoreData) {
+              console.log(`ERROR: style "${file.name}" using unknown mbtiles "${mbtiles}"! Skipping...`);
+              return undefined;
+            } else {
+              let id = mbtiles.substr(0, mbtiles.lastIndexOf('.')) || mbtiles;
+              while (data[id]) id += '_';
+              data[id] = {
+                'mbtiles': mbtiles
+              };
+              return id;
+            }
+          }
+        }, font => {
+          if (reportFonts) {
+            serving.fonts[font] = true;
+          }
+        });
+
+      if(success) {
+        const promise = serve_rendered.addByUrl(options, serving.rendered, styleJson, id, opts.publicUrl,
+          mbtiles => {
+            let mbtilesFile;
+            for (const id of Object.keys(data)) {
+              if (id === mbtiles) {
+                mbtilesFile = data[id].mbtiles;
+              }
+            }
+            return mbtilesFile;
+          }
+        );
+        return promise;
+      }
+      return null;
+    }
+    return null;
+  }
+
   for (const id of Object.keys(config.styles || {})) {
     const item = config.styles[id];
     if (!item.style || item.style.length === 0) {
@@ -182,12 +273,36 @@ function start(opts) {
     addStyle(id, item, true, true);
   }
 
+  const sqlStr = `
+  select row_to_json(t) as json from (
+    select version,id,name,center,zoom,bearing,pitch,sources,glyphs,layers from map_style
+  ) as t
+  `;
+  pool.connect((err, client, done) => {
+    if(err) throw err;
+    client.query(sqlStr, (err, res) => {
+      done();
+      if (err) {
+		throw err;
+      } else {
+        for (let style of res.rows) {
+          const id = style.json.name.toLowerCase();
+          let promise = addUrlStyle(id, style.json, true, true);
+          if(promise) {
+            startupPromises.push(promise);
+          }
+        }
+      }
+    });
+  })
+  
   startupPromises.push(
     serve_font(options, serving.fonts).then(sub => {
       app.use('/', sub);
     })
   );
 
+  // 如果mbtiles数据存在就遍历
   for (const id of Object.keys(data)) {
     const item = data[id];
     if (!item.mbtiles || item.mbtiles.length === 0) {
@@ -196,10 +311,13 @@ function start(opts) {
     }
 
     startupPromises.push(
+      //add 返回的是mbtiles的promises
       serve_data.add(options, serving.data, item, id, opts.publicUrl)
     );
   }
 
+  // 样式遍历
+  // 如果是使用config配置文件的时候，才会有serveAllStyles
   if (options.serveAllStyles) {
     fs.readdir(options.paths.styles, {withFileTypes: true}, (err, files) => {
       if (err) {
@@ -241,9 +359,37 @@ function start(opts) {
       });
   }
 
+  // 设置样式接口
+  app.post('/styles/setStyle.json', (req, res, next) => {
+    const styleJson = JSON.parse(req.body.style);
+    const id = req.body.id;
+    const promise = addUrlStyle(id, styleJson, true, true);
+    if(promise) {
+      promise.then(() => {
+        res.send({
+          code: 0,
+          message: '保存成功',
+          data: null
+        });
+      }).catch(err => {
+        res.send({
+          code: 1,
+          message: '保存失败',
+          data: null
+        });
+      })
+    } else {
+      res.send({
+        code: 1,
+        message: '保存失败',
+        data: null
+      });
+    } 
+  })
+
   app.get('/styles.json', (req, res, next) => {
     const result = [];
-    const query = req.query.key ? (`?key=${encodeURIComponent(req.query.key)}`) : '';
+    const query = req.query.key ? (`?key=${req.query.key}`) : '';
     for (const id of Object.keys(serving.styles)) {
       const styleJSON = serving.styles[id].styleJSON;
       result.push({
@@ -319,8 +465,8 @@ function start(opts) {
           data['public_url'] = opts.publicUrl || '/';
           data['is_light'] = isLight;
           data['key_query_part'] =
-            req.query.key ? `key=${encodeURIComponent(req.query.key)}&amp;` : '';
-          data['key_query'] = req.query.key ? `?key=${encodeURIComponent(req.query.key)}` : '';
+            req.query.key ? `key=${req.query.key}&amp;` : '';
+          data['key_query'] = req.query.key ? `?key=${req.query.key}` : '';
           if (template === 'wmts') res.set('Content-Type', 'text/xml');
           return res.status(200).send(compiled(data));
         });
@@ -362,7 +508,7 @@ function start(opts) {
       if (!data_.is_vector) {
         if (center) {
           const centerPx = mercator.px([center[0], center[1]], center[2]);
-          data_.thumbnail = `${center[2]}/${Math.floor(centerPx[0] / 256)}/${Math.floor(centerPx[1] / 256)}.${data_.tileJSON.format}`;
+          data_.thumbnail = `${center[2]}/${Math.floor(centerPx[0] / 256)}/${Math.floor(centerPx[1] / 256)}.${data_.format}`;
         }
 
         data_.xyz_link = utils.getTileUrls(

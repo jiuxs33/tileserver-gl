@@ -199,6 +199,7 @@ let maxScaleFactor = 2;
 
 module.exports = {
   init: (options, repo) => {
+    // 字体方法
     const fontListingPromise = new Promise((resolve, reject) => {
       fs.readdir(options.paths.fonts, (err, files) => {
         if (err) {
@@ -219,16 +220,16 @@ module.exports = {
         resolve();
       });
     });
-
+    // 图片最大分辨率 @3x
     maxScaleFactor = Math.min(Math.floor(options.maxScaleFactor || 3), 9);
     let scalePattern = '';
     for (let i = 2; i <= maxScaleFactor; i++) {
       scalePattern += i.toFixed();
     }
-    scalePattern = `@[${scalePattern}]x`;
+    scalePattern = `@[${scalePattern}]x`; // @[23]x
 
     const app = express().disable('x-powered-by');
-
+    // 调用mapbox node Lib接口生成图片
     const respondImage = (item, z, lon, lat, bearing, pitch,
       width, height, scale, format, res, next,
       opt_overlay) => {
@@ -274,7 +275,7 @@ module.exports = {
           pool.release(renderer);
           if (err) {
             console.error(err);
-            return res.status(500).send(err);
+            return;
           }
 
           // Fix semi-transparent outlines on raw, premultiplied input
@@ -318,6 +319,7 @@ module.exports = {
           if (opt_overlay) {
             image.composite([{ input: opt_overlay }]);
           }
+          // 水印
           if (item.watermark) {
             const canvas = createCanvas(scale * width, scale * height);
             const ctx = canvas.getContext('2d');
@@ -332,6 +334,7 @@ module.exports = {
             image.composite([{ input: canvas.toBuffer() }]);
           }
 
+          // 压缩比
           const formatQuality = (options.formatQuality || {})[format];
 
           if (format === 'png') {
@@ -355,7 +358,7 @@ module.exports = {
         });
       });
     };
-
+    // 获取样式对应的png
     app.get(`/:id/:z(\\d+)/:x(\\d+)/:y(\\d+):scale(${scalePattern})?.:format([\\w]+)`, (req, res, next) => {
       const item = repo[req.params.id];
       if (!item) {
@@ -375,7 +378,7 @@ module.exports = {
         scale = getScale(req.params.scale),
         format = req.params.format;
       if (z < 0 || x < 0 || y < 0 ||
-        z > 22 || x >= Math.pow(2, z) || y >= Math.pow(2, z)) {
+        z > 20 || x >= Math.pow(2, z) || y >= Math.pow(2, z)) {
         return res.status(404).send('Out of bounds');
       }
       const tileSize = 256;
@@ -387,6 +390,7 @@ module.exports = {
         tileSize, tileSize, scale, format, res, next);
     });
 
+    // 静态图片获取API
     if (options.serveStaticMaps !== false) {
       const staticPattern =
         `/:id/static/:raw(raw)?/%s/:width(\\d+)x:height(\\d+):scale(${scalePattern})?.:format([\\w]+)`;
@@ -439,12 +443,10 @@ module.exports = {
           return res.sendStatus(404);
         }
         const raw = req.params.raw;
-        const bbox = [+req.params.minx, +req.params.miny,
-        +req.params.maxx, +req.params.maxy];
+        const bbox = [+req.params.minx, +req.params.miny, +req.params.maxx, +req.params.maxy];
         let center = [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2];
 
-        const transformer = raw ?
-          mercator.inverse.bind(mercator) : item.dataProjWGStoInternalWGS;
+        const transformer = raw ? mercator.inverse.bind(mercator) : item.dataProjWGStoInternalWGS;
 
         if (transformer) {
           const minCorner = transformer(bbox.slice(0, 2));
@@ -549,7 +551,7 @@ module.exports = {
           res, next, overlay);
       });
     }
-
+    // 返回样式
     app.get('/:id.json', (req, res, next) => {
       const item = repo[req.params.id];
       if (!item) {
@@ -561,8 +563,18 @@ module.exports = {
       return res.send(info);
     });
 
+    // fontListingPromise执行完以后，执行then
     return Promise.all([fontListingPromise]).then(() => app);
   },
+  /**
+   * @param {Object} options 配置
+   * @param {Object} repo 渲染器对象 serve_rendered
+   * @param {Object} params 样式文件 eg. {style: 'hz-dark/style.json', tilejson:{}}
+   * @param {String} id 样式id
+   * @param {String} publicUrl 
+   * @param {function} dataResolver 数据解析器
+   * 
+   */
   add: (options, repo, params, id, publicUrl, dataResolver) => {
     const map = {
       renderers: [],
@@ -696,6 +708,7 @@ module.exports = {
       styleJSON.glyphs = `fonts://${styleJSON.glyphs}`;
     }
 
+    // 去掉样式中的3d 扩展
     for (const layer of (styleJSON.layers || [])) {
       if (layer && layer.paint) {
         // Remove (flatten) 3D buildings
@@ -719,6 +732,270 @@ module.exports = {
       'type': 'baselayer'
     };
     const attributionOverride = params.tilejson && params.tilejson.attribution;
+    // 将parasm.tilejson对象拷贝到tileJSON中
+    Object.assign(tileJSON, params.tilejson || {});
+    tileJSON.tiles = params.domains || options.domains;
+    utils.fixTileJSONCenter(tileJSON);
+
+    repo[id] = {
+      tileJSON,
+      publicUrl,
+      map,
+      dataProjWGStoInternalWGS: null,
+      lastModified: new Date().toUTCString(),
+      watermark: params.watermark || options.watermark
+    };
+
+    const queue = [];
+    for (const name of Object.keys(styleJSON.sources)) {
+      let source = styleJSON.sources[name];
+      const url = source.url;
+
+      if (url && url.lastIndexOf('mbtiles:', 0) === 0) {
+        // found mbtiles source, replace with info from local file
+        delete source.url;
+
+        let mbtilesFile = url.substring('mbtiles://'.length);
+        const fromData = mbtilesFile[0] === '{' &&
+          mbtilesFile[mbtilesFile.length - 1] === '}';
+
+        if (fromData) {
+          mbtilesFile = mbtilesFile.substr(1, mbtilesFile.length - 2);
+          const mapsTo = (params.mapping || {})[mbtilesFile];
+          if (mapsTo) {
+            mbtilesFile = mapsTo;
+          }
+          mbtilesFile = dataResolver(mbtilesFile);
+          if (!mbtilesFile) {
+            console.error(`ERROR: data "${mbtilesFile}" not found!`);
+            process.exit(1);
+          }
+        }
+
+        queue.push(new Promise((resolve, reject) => {
+          mbtilesFile = path.resolve(options.paths.mbtiles, mbtilesFile);
+          const mbtilesFileStats = fs.statSync(mbtilesFile);
+          if (!mbtilesFileStats.isFile() || mbtilesFileStats.size === 0) {
+            throw Error(`Not valid MBTiles file: ${mbtilesFile}`);
+          }
+          map.sources[name] = new MBTiles(mbtilesFile, err => {
+            map.sources[name].getInfo((err, info) => {
+              if (err) {
+                console.error(err);
+                return;
+              }
+
+              if (!repo[id].dataProjWGStoInternalWGS && info.proj4) {
+                // how to do this for multiple sources with different proj4 defs?
+                const to3857 = proj4('EPSG:3857');
+                const toDataProj = proj4(info.proj4);
+                repo[id].dataProjWGStoInternalWGS = xy => to3857.inverse(toDataProj.forward(xy));
+              }
+
+              const type = source.type;
+              Object.assign(source, info);
+              source.type = type;
+              source.tiles = [
+                // meta url which will be detected when requested
+                `mbtiles://${name}/{z}/{x}/{y}.${info.format || 'pbf'}`
+              ];
+              delete source.scheme;
+
+              if (options.dataDecoratorFunc) {
+                source = options.dataDecoratorFunc(name, 'tilejson', source);
+              }
+
+              if (!attributionOverride &&
+                source.attribution && source.attribution.length > 0) {
+                if (tileJSON.attribution.length > 0) {
+                  tileJSON.attribution += '; ';
+                }
+                tileJSON.attribution += source.attribution;
+              }
+              resolve();
+            });
+          });
+        }));
+      }
+    }
+
+    const renderersReadyPromise = Promise.all(queue).then(() => {
+      // standard and @2x tiles are much more usual -> default to larger pools
+      const minPoolSizes = options.minRendererPoolSizes || [8, 4, 2];
+      const maxPoolSizes = options.maxRendererPoolSizes || [16, 8, 4];
+      for (let s = 1; s <= maxScaleFactor; s++) {
+        const i = Math.min(minPoolSizes.length - 1, s - 1);
+        const j = Math.min(maxPoolSizes.length - 1, s - 1);
+        const minPoolSize = minPoolSizes[i];
+        const maxPoolSize = Math.max(minPoolSize, maxPoolSizes[j]);
+        map.renderers[s] = createPool(s, minPoolSize, maxPoolSize);
+      }
+    });
+
+    return Promise.all([renderersReadyPromise]);
+  },
+
+  /**
+   * 自己的方法
+   */
+  addByUrl: (options, repo, params, id, publicUrl, dataResolver) => {
+    const map = {
+      renderers: [],
+      sources: {}
+    };
+
+    let styleJSON = params;
+    const createPool = (ratio, min, max) => {
+      const createRenderer = (ratio, createCallback) => {
+        const renderer = new mbgl.Map({
+          mode: "tile",
+          ratio: ratio,
+          request: (req, callback) => {
+            const protocol = req.url.split(':')[0];
+            //console.log('Handling request:', req);
+            if (protocol === 'sprites') {
+              const dir = options.paths[protocol];
+              const file = unescape(req.url).substring(protocol.length + 3);
+              fs.readFile(path.join(dir, file), (err, data) => {
+                callback(err, { data: data });
+              });
+            } else if (protocol === 'fonts') {
+              const parts = req.url.split('/');
+              const fontstack = unescape(parts[2]);
+              const range = parts[3].split('.')[0];
+              utils.getFontsPbf(
+                null, options.paths[protocol], fontstack, range, existingFonts
+              ).then(concated => {
+                callback(null, { data: concated });
+              }, err => {
+                callback(err, { data: null });
+              });
+            } else if (protocol === 'mbtiles') {
+              const parts = req.url.split('/');
+              const sourceId = parts[2];
+              const source = map.sources[sourceId];
+              const sourceInfo = styleJSON.sources[sourceId];
+              const z = parts[3] | 0,
+                x = parts[4] | 0,
+                y = parts[5].split('.')[0] | 0,
+                format = parts[5].split('.')[1];
+              source.getTile(z, x, y, (err, data, headers) => {
+                if (err) {
+                  if (options.verbose) console.log('MBTiles error, serving empty', err);
+                  createEmptyResponse(sourceInfo.format, sourceInfo.color, callback);
+                  return;
+                }
+
+                const response = {};
+                if (headers['Last-Modified']) {
+                  response.modified = new Date(headers['Last-Modified']);
+                }
+
+                if (format === 'pbf') {
+                  try {
+                    response.data = zlib.unzipSync(data);
+                  } catch (err) {
+                    console.log("Skipping incorrect header for tile mbtiles://%s/%s/%s/%s.pbf", id, z, x, y);
+                  }
+                  if (options.dataDecoratorFunc) {
+                    response.data = options.dataDecoratorFunc(
+                      sourceId, 'data', response.data, z, x, y);
+                  }
+                } else {
+                  response.data = data;
+                }
+
+                callback(null, response);
+              });
+            } else if (protocol === 'http' || protocol === 'https') {
+              request({
+                url: req.url,
+                encoding: null,
+                gzip: true
+              }, (err, res, body) => {
+                const parts = url.parse(req.url);
+                const extension = path.extname(parts.pathname).toLowerCase();
+                const format = extensionToFormat[extension] || '';
+                if (err || res.statusCode < 200 || res.statusCode >= 300) {
+                  // console.log('HTTP error', err || res.statusCode);
+                  createEmptyResponse(format, '', callback);
+                  return;
+                }
+
+                const response = {};
+                if (res.headers.modified) {
+                  response.modified = new Date(res.headers.modified);
+                }
+                if (res.headers.expires) {
+                  response.expires = new Date(res.headers.expires);
+                }
+                if (res.headers.etag) {
+                  response.etag = res.headers.etag;
+                }
+
+                response.data = body;
+                callback(null, response);
+              });
+            }
+          }
+        });
+        renderer.load(styleJSON);
+        createCallback(null, renderer);
+      };
+      return new advancedPool.Pool({
+        min: min,
+        max: max,
+        create: createRenderer.bind(null, ratio),
+        destroy: renderer => {
+          renderer.release();
+        }
+      });
+    };
+
+    /**const styleFile = params.style;
+    const styleJSONPath = path.resolve(options.paths.styles, styleFile);
+    try {
+      styleJSON = JSON.parse(fs.readFileSync(styleJSONPath));
+    } catch (e) {
+      console.log('Error parsing style file');
+      return false;
+    }*/
+
+    if (styleJSON.sprite && !httpTester.test(styleJSON.sprite)) {
+      styleJSON.sprite = 'sprites://' +
+        styleJSON.sprite
+          .replace('{style}', path.basename(styleFile, '.json'))
+          .replace('{styleJsonFolder}', path.relative(options.paths.sprites, path.dirname(styleJSONPath)));
+    }
+    if (styleJSON.glyphs && !httpTester.test(styleJSON.glyphs)) {
+      styleJSON.glyphs = `fonts://${styleJSON.glyphs}`;
+    }
+
+    // 去掉样式中的3d 扩展
+    for (const layer of (styleJSON.layers || [])) {
+      if (layer && layer.paint) {
+        // Remove (flatten) 3D buildings
+        if (layer.paint['fill-extrusion-height']) {
+          layer.paint['fill-extrusion-height'] = 0;
+        }
+        if (layer.paint['fill-extrusion-base']) {
+          layer.paint['fill-extrusion-base'] = 0;
+        }
+      }
+    }
+
+    const tileJSON = {
+      'tilejson': '2.0.0',
+      'name': styleJSON.name,
+      'attribution': '',
+      'minzoom': 0,
+      'maxzoom': 20,
+      'bounds': [-180, -85.0511, 180, 85.0511],
+      'format': 'png',
+      'type': 'baselayer'
+    };
+    const attributionOverride = params.tilejson && params.tilejson.attribution;
+    // 将parasm.tilejson对象拷贝到tileJSON中
     Object.assign(tileJSON, params.tilejson || {});
     tileJSON.tiles = params.domains || options.domains;
     utils.fixTileJSONCenter(tileJSON);

@@ -17,7 +17,7 @@ const fixUrl = (req, url, publicUrl, opt_nokey) => {
   }
   const queryParams = [];
   if (!opt_nokey && req.query.key) {
-    queryParams.unshift(`key=${encodeURIComponent(req.query.key)}`);
+    queryParams.unshift(`key=${req.query.key}`);
   }
   let query = '';
   if (queryParams.length) {
@@ -43,7 +43,7 @@ module.exports = {
       }
       // mapbox-gl-js viewer cannot handle sprite urls with query
       if (styleJSON_.sprite) {
-        styleJSON_.sprite = fixUrl(req, styleJSON_.sprite, item.publicUrl, false);
+        styleJSON_.sprite = fixUrl(req, styleJSON_.sprite, item.publicUrl, true);
       }
       if (styleJSON_.glyphs) {
         styleJSON_.glyphs = fixUrl(req, styleJSON_.glyphs, item.publicUrl, false);
@@ -77,16 +77,19 @@ module.exports = {
     delete repo[id];
   },
   add: (options, repo, params, id, publicUrl, reportTiles, reportFont) => {
+    // id对应的样式文件路径
     const styleFile = path.resolve(options.paths.styles, params.style);
 
     let styleFileData;
     try {
+      // 读取json文件
       styleFileData = fs.readFileSync(styleFile);
     } catch (e) {
       console.log('Error reading style file');
       return false;
     }
 
+    // 验证json文件有效性
     let validationErrors = validate(styleFileData);
     if (validationErrors.length > 0) {
       console.log(`The file "${params.style}" is not valid a valid style file:`);
@@ -95,17 +98,24 @@ module.exports = {
       }
       return false;
     }
+
+    // 将文件转成json对象
     let styleJSON = JSON.parse(styleFileData);
 
+    //遍历json文件 获取source节点
     for (const name of Object.keys(styleJSON.sources)) {
       const source = styleJSON.sources[name];
       const url = source.url;
+      // 判断是不是以mbtiles开头的url
       if (url && url.lastIndexOf('mbtiles:', 0) === 0) {
         let mbtilesFile = url.substring('mbtiles://'.length);
+
+        // fromData bool类型 判断mbtilesFile是不是以'{'开头，以'}'结尾
         const fromData = mbtilesFile[0] === '{' &&
           mbtilesFile[mbtilesFile.length - 1] === '}';
 
         if (fromData) {
+          //mbtiles文件名
           mbtilesFile = mbtilesFile.substr(1, mbtilesFile.length - 2);
           const mapsTo = (params.mapping || {})[mbtilesFile];
           if (mapsTo) {
@@ -120,6 +130,7 @@ module.exports = {
       }
     }
 
+    // 字体
     for (let obj of styleJSON.layers) {
       if (obj['type'] === 'symbol') {
         const fonts = (obj['layout'] || {})['text-font'];
@@ -132,6 +143,7 @@ module.exports = {
       }
     }
 
+    //雪碧图图标
     let spritePath;
 
     if (styleJSON.sprite && !httpTester.test(styleJSON.sprite)) {
@@ -142,6 +154,91 @@ module.exports = {
       );
       styleJSON.sprite = `local://styles/${id}/sprite`;
     }
+
+    //字体url
+    if (styleJSON.glyphs && !httpTester.test(styleJSON.glyphs)) {
+      styleJSON.glyphs = 'local://fonts/{fontstack}/{range}.pbf';
+    }
+
+    repo[id] = {
+      styleJSON,
+      spritePath,
+      publicUrl,
+      name: styleJSON.name
+    };
+
+    return true;
+  },
+
+  addByUrl: (options, repo, params, id, publicUrl, reportTiles, reportFont) => {
+    let styleFileData = params;
+    // 验证json文件有效性
+    let validationErrors = validate(styleFileData);
+    if (validationErrors.length > 0) {
+      console.log(`The file "${params.style}" is not valid a valid style file:`);
+      for (const err of validationErrors) {
+        console.log(`${err.line}: ${err.message}`);
+      }
+      return false;
+    }
+
+    // 将文件转成json对象
+    let styleJSON = styleFileData;
+
+    //遍历json文件 获取source节点
+    for (const name of Object.keys(styleJSON.sources)) {
+      const source = styleJSON.sources[name];
+      const url = source.url;
+      // 判断是不是以mbtiles开头的url
+      if (url && url.lastIndexOf('mbtiles:', 0) === 0) {
+        let mbtilesFile = url.substring('mbtiles://'.length);
+
+        // fromData bool类型 判断mbtilesFile是不是以'{'开头，以'}'结尾
+        const fromData = mbtilesFile[0] === '{' &&
+          mbtilesFile[mbtilesFile.length - 1] === '}';
+
+        if (fromData) {
+          //mbtiles文件名
+          mbtilesFile = mbtilesFile.substr(1, mbtilesFile.length - 2);
+          const mapsTo = (params.mapping || {})[mbtilesFile];
+          if (mapsTo) {
+            mbtilesFile = mapsTo;
+          }
+        }
+        const identifier = reportTiles(mbtilesFile, fromData);
+        if (!identifier) {
+          return false;
+        }
+        source.url = `local://data/${identifier}.json`;
+      }
+    }
+
+    // 字体
+    for (let obj of styleJSON.layers) {
+      if (obj['type'] === 'symbol') {
+        const fonts = (obj['layout'] || {})['text-font'];
+        if (fonts && fonts.length) {
+          fonts.forEach(reportFont);
+        } else {
+          reportFont('Open Sans Regular');
+          reportFont('Arial Unicode MS Regular');
+        }
+      }
+    }
+
+    //雪碧图图标
+    let spritePath;
+
+    if (styleJSON.sprite && !httpTester.test(styleJSON.sprite)) {
+      spritePath = path.join(options.paths.sprites,
+        styleJSON.sprite
+          .replace('{style}', path.basename(styleFile, '.json'))
+          .replace('{styleJsonFolder}', path.relative(options.paths.sprites, path.dirname(styleFile)))
+      );
+      styleJSON.sprite = `local://styles/${id}/sprite`;
+    }
+
+    //字体url
     if (styleJSON.glyphs && !httpTester.test(styleJSON.glyphs)) {
       styleJSON.glyphs = 'local://fonts/{fontstack}/{range}.pbf';
     }
